@@ -14,6 +14,7 @@ import logging
 import re
 from datetime import datetime, timedelta
 import base64
+from serpapi_pool import get_key, status as pool_status
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -194,149 +195,31 @@ async def get_fda(molecule: str) -> List[Dict[str, Any]]:
 async def search_patents(molecule: str, deep_search: bool = True) -> Dict[str, Any]:
     start = datetime.now()
     logger.info(f"🔍 SEARCH: {molecule} (deep={deep_search})")
-    
-    # Estatísticas de cada camada
-    layer_stats = {
-        "pubchem": {"success": False, "dev_codes_found": 0, "cas_found": False, "synonyms_count": 0, "error": None},
-        "wo_discovery": {"success": False, "wo_numbers_found": 0, "sources_used": 0, "error": None},
-        "epo_ops": {"success": False, "br_patents_found": 0, "wo_processed": 0, "error": None},
-        "inpi_deep_search": {"success": False, "queries_executed": 0, "patents_found": 0, "error": None},
-        "fda_orange_book": {"success": False, "entries_found": 0, "error": None}
-    }
-    
-    # Layer 1: PubChem
-    try:
-        pubchem = await get_pubchem(molecule)
-        dev_codes = pubchem["dev_codes"]
-        cas = pubchem["cas"]
-        synonyms = pubchem.get("synonyms", [])
-        layer_stats["pubchem"] = {
-            "success": True,
-            "dev_codes_found": len(dev_codes),
-            "cas_found": cas is not None,
-            "synonyms_count": len(synonyms),
-            "error": None
-        }
-    except Exception as e:
-        logger.error(f"PubChem error: {e}")
-        dev_codes = []
-        cas = None
-        synonyms = []
-        layer_stats["pubchem"]["error"] = str(e)
-    
-    # Layer 2: WO Discovery
-    try:
-        wo_numbers = await discover_wo(molecule, dev_codes)
-        layer_stats["wo_discovery"] = {
-            "success": len(wo_numbers) > 0,
-            "wo_numbers_found": len(wo_numbers),
-            "sources_used": 3,  # Google Patents + PubChem context
-            "error": None
-        }
-    except Exception as e:
-        logger.error(f"WO Discovery error: {e}")
-        wo_numbers = []
-        layer_stats["wo_discovery"]["error"] = str(e)
-    
-    # Layer 3: EPO OPS
+    pubchem = await get_pubchem(molecule)
+    dev_codes = pubchem["dev_codes"]
+    cas = pubchem["cas"]
+    wo_numbers = await discover_wo(molecule, dev_codes)
     epo_token = await get_epo_token()
     br_from_epo = []
     if epo_token and wo_numbers:
-        try:
-            for wo in wo_numbers[:5]:
-                br_list = await get_epo_family(wo, epo_token)
-                br_from_epo.extend(br_list)
-                await asyncio.sleep(0.5)
-            layer_stats["epo_ops"] = {
-                "success": len(br_from_epo) > 0,
-                "br_patents_found": len(br_from_epo),
-                "wo_processed": min(len(wo_numbers), 5),
-                "error": None
-            }
-        except Exception as e:
-            logger.error(f"EPO error: {e}")
-            layer_stats["epo_ops"]["error"] = str(e)
-    else:
-        layer_stats["epo_ops"]["error"] = "No EPO token or no WO numbers"
-    
-    # Layer 4: INPI Deep Search (15 queries)
+        for wo in wo_numbers[:5]:
+            br_list = await get_epo_family(wo, epo_token)
+            br_from_epo.extend(br_list)
+            await asyncio.sleep(0.5)
     inpi_patents = []
     if deep_search:
-        try:
-            inpi_patents = await search_inpi(molecule, dev_codes, cas)
-            # Count how many unique query sources contributed
-            sources = set([p.get("source", "") for p in inpi_patents])
-            layer_stats["inpi_deep_search"] = {
-                "success": len(inpi_patents) > 0,
-                "queries_executed": 15,  # Always 15 queries in deep search
-                "patents_found": len(inpi_patents),
-                "successful_queries": len(sources),
-                "error": None
-            }
-        except Exception as e:
-            logger.error(f"INPI error: {e}")
-            layer_stats["inpi_deep_search"]["error"] = str(e)
-    else:
-        layer_stats["inpi_deep_search"] = {
-            "success": False,
-            "queries_executed": 0,
-            "patents_found": 0,
-            "error": "Deep search disabled"
-        }
-    
-    # Layer 5: FDA Orange Book
-    try:
-        fda_data = await get_fda(molecule)
-        layer_stats["fda_orange_book"] = {
-            "success": len(fda_data) > 0,
-            "entries_found": len(fda_data),
-            "error": None
-        }
-    except Exception as e:
-        logger.error(f"FDA error: {e}")
-        fda_data = []
-        layer_stats["fda_orange_book"]["error"] = str(e)
-    
+        inpi_patents = await search_inpi(molecule, dev_codes, cas)
+    fda_data = await get_fda(molecule)
     elapsed = (datetime.now() - start).total_seconds()
-    
-    # Calculate overall success
-    layers_successful = sum(1 for stat in layer_stats.values() if stat["success"])
-    total_layers = len(layer_stats)
-    
     result = {
-        "consulta": {
-            "termo_pesquisado": molecule,
-            "data_consulta": datetime.now().isoformat(),
-            "nome_molecula": molecule,
-            "pais_alvo": ["Brasil"]
-        },
-        "molecule_info": {
-            "chemical_name": molecule,
-            "dev_codes": dev_codes,
-            "cas_number": cas,
-            "synonyms_count": len(synonyms)
-        },
-        "search_result": {
-            "wo_numbers": wo_numbers,
-            "total_wo_discovered": len(wo_numbers),
-            "br_from_epo": br_from_epo,
-            "total_br_from_epo": len(br_from_epo),
-            "inpi_patents": inpi_patents,
-            "total_inpi_patents": len(inpi_patents)
-        },
+        "molecule_info": {"name": molecule, "dev_codes": dev_codes, "cas_number": cas, "synonyms_count": len(pubchem.get("synonyms", []))},
+        "search_result": {"wo_numbers": wo_numbers, "total_wo_discovered": len(wo_numbers), "br_from_epo": br_from_epo, "total_br_from_epo": len(br_from_epo), "inpi_patents": inpi_patents, "total_inpi_patents": len(inpi_patents)},
         "orange_book_entries": fda_data,
-        "layer_statistics": layer_stats,
-        "summary": {
-            "total_br_patents": len(inpi_patents),
-            "layers_executed": total_layers,
-            "layers_successful": layers_successful,
-            "success_rate": f"{round((layers_successful/total_layers)*100)}%"
-        },
         "execution_time_seconds": round(elapsed, 2),
         "timestamp": datetime.now().isoformat(),
         "api_version": "3.0.0"
     }
-    logger.info(f"✅ Done {elapsed:.2f}s | WOs:{len(wo_numbers)} BRs:{len(inpi_patents)} | Success: {layers_successful}/{total_layers}")
+    logger.info(f"✅ Done {elapsed:.2f}s | WOs:{len(wo_numbers)} BRs:{len(inpi_patents)}")
     return result
 
 @app.get("/")
@@ -346,6 +229,17 @@ async def root():
 @app.get("/health")
 async def health():
     return {"status": "healthy", "version": "3.0.0", "timestamp": datetime.now().isoformat()}
+
+@app.get("/api/v1/serpapi/status")
+async def serpapi_status():
+    """Status do pool de API keys da SerpAPI"""
+    return JSONResponse(content=pool_status())
+
+@app.get("/api/v1/serpapi/key")
+async def serpapi_key():
+    """Retorna próxima key disponível do pool"""
+    key = get_key()
+    return {"key": key[:20] + "..." if key else None, "available": key is not None}
 
 @app.get("/api/v1/search")
 async def search(molecule_name: str = Query(...), deep_search: bool = Query(True)):
